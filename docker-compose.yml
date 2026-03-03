@@ -11,5 +11,5 @@ services:
       - path: .env
         required: false
     ports:
-      - "${HTTP_PORT:-6500}:${HTTP_PORT:-6500}"
+      - "${DOCKER_HTTP_IP:-127.0.0.1}:${DOCKER_HTTP_PORT:-6500}:${DOCKER_HTTP_PORT:-6500}"
     restart: unless-stopped
