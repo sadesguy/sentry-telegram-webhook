@@ -95,13 +95,14 @@ export const issueAlertSchema = z.object({
                                             mode: z.string(),
                                             name: z.string(),
                                         })
-                                        .partial(),
+                                        .partial()
+                                        .nullish(),
                                     description: z.string().nullish(),
-                                    handled: z.boolean(),
-                                    help_link: z.string(),
-                                    meta: z.string(),
-                                    synthetic: z.unknown(),
-                                    type: z.string(),
+                                    handled: z.boolean().nullish(),
+                                    help_link: z.string().nullish(),
+                                    meta: z.unknown().nullish(),
+                                    synthetic: z.unknown().nullish(),
+                                    type: z.string().nullish(),
                                 })
                                 .partial()
                                 .nullish(),
