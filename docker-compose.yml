@@ -1,0 +1,15 @@
+services:
+  sentry-telegram-webhook:
+    container_name: sentry-telegram-webhook
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sentry-telegram-webhook:latest
+    env_file:
+      - path: .env.example
+        required: true
+      - path: .env
+        required: false
+    ports:
+      - "${HTTP_PORT:-6500}:${HTTP_PORT:-6500}"
+    restart: unless-stopped
