@@ -36,7 +36,6 @@ export type SendMessageOptions = {
 
 export type EditMessageOptions = {
     chatId: number;
-    topicId?: number;
     messageId: number;
     message: string;
     parseMode?: "HTML" | "MarkdownV2";
@@ -105,6 +104,8 @@ export async function sendMessage(
             message_thread_id: options.topicId,
             text: messageChunk,
             parse_mode: options.parseMode ?? "MarkdownV2",
+            disable_web_page_preview: options.disableLinkPreview,
+            protect_content: options.protectContent,
         };
 
         const response = await fetch(requestUrl, {
@@ -165,7 +166,6 @@ export async function editMessage(
     const requestUrl = new URL(`https://api.telegram.org/bot${botToken}/editMessageText`);
     const requestBody = {
         chat_id: options.chatId,
-        message_thread_id: options.topicId,
         message_id: options.messageId,
         text: options.message,
         parse_mode: options.parseMode ?? "MarkdownV2",

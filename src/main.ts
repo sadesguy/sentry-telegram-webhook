@@ -23,6 +23,8 @@ type ErrorCreatedCounterEntry = {
     title: string;
     project?: string;
     detailUrl?: string;
+    environment?: string;
+    serverName?: string;
     observedAt: unknown;
     count: number;
     messageId?: number;
@@ -30,6 +32,7 @@ type ErrorCreatedCounterEntry = {
 };
 
 const errorCreatedCounterEntries = new Map<string, ErrorCreatedCounterEntry>();
+const errorCreatedCounterUpdateQueue = new Map<string, Promise<void>>();
 
 function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null;
@@ -200,6 +203,77 @@ function extractEnvironment(tags: unknown): string | undefined {
     return undefined;
 }
 
+function extractTagValue(tags: unknown, tagKeys: string[]): string | undefined {
+    const normalizedTagKeys = new Set(tagKeys.map((tagKey) => tagKey.toLowerCase()));
+
+    if (Array.isArray(tags)) {
+        for (const tag of tags) {
+            if (Array.isArray(tag) && tag.length >= 2) {
+                const key = asString(tag.at(0))?.toLowerCase();
+                if (key !== undefined && normalizedTagKeys.has(key)) {
+                    const value = tag
+                        .slice(1)
+                        .map((part) => asString(part))
+                        .filter((part): part is string => part !== undefined)
+                        .join(" ")
+                        .trim();
+                    if (value !== "") {
+                        return value;
+                    }
+                }
+            }
+
+            if (isRecord(tag)) {
+                const key = asString(tag.key)?.toLowerCase();
+                if (key !== undefined && normalizedTagKeys.has(key)) {
+                    const value = asString(tag.value);
+                    if (value !== undefined) {
+                        return value;
+                    }
+                }
+            }
+        }
+    }
+
+    if (isRecord(tags)) {
+        for (const tagKey of tagKeys) {
+            const value = asString(tags[tagKey]);
+            if (value !== undefined) {
+                return value;
+            }
+        }
+    }
+
+    return undefined;
+}
+
+function buildConfiguredSentryDetailUrl(
+    detailUrl: string | undefined,
+    configuredSentryUrl: string | undefined,
+): string | undefined {
+    const sanitizedDetailUrl = asString(detailUrl);
+    const sanitizedConfiguredSentryUrl = asString(configuredSentryUrl);
+    if (sanitizedDetailUrl === undefined || sanitizedConfiguredSentryUrl === undefined) {
+        return undefined;
+    }
+
+    try {
+        const detail = new URL(sanitizedDetailUrl);
+        const configured = new URL(sanitizedConfiguredSentryUrl);
+        configured.pathname = detail.pathname;
+        configured.search = detail.search;
+        configured.hash = detail.hash;
+
+        const rewrittenUrl = configured.toString();
+        if (rewrittenUrl === detail.toString()) {
+            return undefined;
+        }
+        return rewrittenUrl;
+    } catch {
+        return undefined;
+    }
+}
+
 function inferSentryHookResource(requestBody: unknown): string | undefined {
     const root = asRecord(requestBody);
     const data = asRecord(root?.data);
@@ -356,6 +430,8 @@ function buildErrorCreatedCounterMessage(
     title: string,
     project: string | undefined,
     detailUrl: string | undefined,
+    environment: string | undefined,
+    serverName: string | undefined,
     observedAt: unknown,
     count: number,
 ): string {
@@ -364,10 +440,20 @@ function buildErrorCreatedCounterMessage(
     if (project !== undefined) {
         message += `\nProject: ${escapeHtml(project)}`;
     }
+    if (environment !== undefined) {
+        message += `\nEnvironment: ${escapeHtml(environment)}`;
+    }
+    if (serverName !== undefined) {
+        message += `\nServer: ${escapeHtml(serverName)}`;
+    }
 
     message += `\n\nDate: ${escapeHtml(formatDate(observedAt, configuration.timeZone))}`;
     if (detailUrl !== undefined) {
         message += `\nDetail: ${escapeHtml(detailUrl)}`;
+    }
+    const configuredDetailUrl = buildConfiguredSentryDetailUrl(detailUrl, configuration.sentryUrl);
+    if (configuredDetailUrl !== undefined) {
+        message += `\nDetail (Configured URL): ${escapeHtml(configuredDetailUrl)}`;
     }
     message += `\nCount: ${count}`;
 
@@ -386,6 +472,8 @@ async function upsertErrorCreatedMessage(
     title: string,
     project: string | undefined,
     detailUrl: string | undefined,
+    environment: string | undefined,
+    serverName: string | undefined,
     observedAt: unknown,
 ): Promise<void> {
     const now = Date.now();
@@ -397,6 +485,8 @@ async function upsertErrorCreatedMessage(
         title,
         project,
         detailUrl: detailUrl ?? existingEntry?.detailUrl,
+        environment: environment ?? existingEntry?.environment,
+        serverName: serverName ?? existingEntry?.serverName,
         observedAt,
         count: (existingEntry?.count ?? 0) + 1,
         messageId: existingEntry?.messageId,
@@ -408,6 +498,8 @@ async function upsertErrorCreatedMessage(
         nextEntry.title,
         nextEntry.project,
         nextEntry.detailUrl,
+        nextEntry.environment,
+        nextEntry.serverName,
         nextEntry.observedAt,
         nextEntry.count,
     );
@@ -416,7 +508,6 @@ async function upsertErrorCreatedMessage(
         if (nextEntry.messageId !== undefined) {
             const edited = await editMessage(configuration.telegramBotToken, {
                 chatId: configuration.telegramGroupId,
-                topicId: configuration.telegramTopicId,
                 messageId: nextEntry.messageId,
                 message,
                 parseMode: "HTML",
@@ -427,6 +518,14 @@ async function upsertErrorCreatedMessage(
             if (edited) {
                 return;
             }
+
+            logger.warn({
+                msg: "failed to edit existing error counter message, skipping resend to avoid duplicate alerts",
+                title,
+                project,
+                messageId: nextEntry.messageId,
+            });
+            return;
         }
 
         const sentMessageIds = await sendMessage(configuration.telegramBotToken, {
@@ -457,6 +556,29 @@ async function upsertErrorCreatedMessage(
             project,
         });
     }
+}
+
+function scheduleErrorCreatedMessageUpdate(
+    title: string,
+    project: string | undefined,
+    detailUrl: string | undefined,
+    environment: string | undefined,
+    serverName: string | undefined,
+    observedAt: unknown,
+): void {
+    const entryKey = buildErrorCreatedCounterEntryKey(title, project);
+    const previousTask = errorCreatedCounterUpdateQueue.get(entryKey) ?? Promise.resolve();
+
+    const nextTask = previousTask
+        .catch(() => undefined)
+        .then(() => upsertErrorCreatedMessage(title, project, detailUrl, environment, serverName, observedAt))
+        .finally(() => {
+            if (errorCreatedCounterUpdateQueue.get(entryKey) === nextTask) {
+                errorCreatedCounterUpdateQueue.delete(entryKey);
+            }
+        });
+
+    errorCreatedCounterUpdateQueue.set(entryKey, nextTask);
 }
 
 if (configuration.selfSentryDsn !== "") {
@@ -781,6 +903,7 @@ app.post("/sentry/webhook", pinoLogger({ pino: logger }), async (c) => {
         case "error": {
             const data = asRecord(requestBodyRecord?.data);
             const errorPayload = asRecord(data?.error) ?? data;
+            const issuePayload = asRecord(data?.issue) ?? asRecord(errorPayload?.issue);
 
             if (errorPayload !== undefined) {
                 const title =
@@ -797,6 +920,21 @@ app.post("/sentry/webhook", pinoLogger({ pino: logger }), async (c) => {
                     asString(errorPayload.url) ??
                     asString(data?.web_url) ??
                     asString(data?.url);
+                const environment =
+                    asString(errorPayload.environment) ??
+                    asString(issuePayload?.environment) ??
+                    extractEnvironment(errorPayload.tags ?? issuePayload?.tags ?? data?.tags);
+                const serverName =
+                    asString(errorPayload.server_name) ??
+                    asString(errorPayload.serverName) ??
+                    asString(issuePayload?.culprit) ??
+                    extractTagValue(errorPayload.tags ?? issuePayload?.tags ?? data?.tags, [
+                        "server_name",
+                        "server",
+                        "host",
+                        "hostname",
+                    ]);
+                const configuredDetailUrl = buildConfiguredSentryDetailUrl(detailUrl, configuration.sentryUrl);
                 const observedAt =
                     errorPayload.timestamp ??
                     errorPayload.date_created ??
@@ -808,13 +946,22 @@ app.post("/sentry/webhook", pinoLogger({ pino: logger }), async (c) => {
                 if (project !== undefined) {
                     errorMessage += `\nProject: ${escapeHtml(project)}`;
                 }
+                if (environment !== undefined) {
+                    errorMessage += `\nEnvironment: ${escapeHtml(environment)}`;
+                }
+                if (serverName !== undefined) {
+                    errorMessage += `\nServer: ${escapeHtml(serverName)}`;
+                }
                 errorMessage += `\n<b>Date:</b> ${escapeHtml(formatDate(observedAt, configuration.timeZone))}`;
                 if (detailUrl !== undefined) {
                     errorMessage += `\n<b>Detail:</b> ${escapeHtml(detailUrl)}`;
                 }
+                if (configuredDetailUrl !== undefined) {
+                    errorMessage += `\n<b>Detail (Configured URL):</b> ${escapeHtml(configuredDetailUrl)}`;
+                }
 
                 if (action.toLowerCase() === "created") {
-                    await upsertErrorCreatedMessage(title, project, detailUrl, observedAt);
+                    scheduleErrorCreatedMessageUpdate(title, project, detailUrl, environment, serverName, observedAt);
                     errorCreatedMessageHandled = true;
                 } else {
                     message = errorMessage;
