@@ -1,19 +1,35 @@
 import { createHmac } from "node:crypto";
 import * as process from "node:process";
 import { serve } from "@hono/node-server";
+import * as SentryNode from "@sentry/node";
 import { Hono } from "hono";
 import { pinoLogger } from "hono-pino";
 import { type Logger, pino } from "pino";
 import { ZodError } from "zod";
 import { issueAlertSchema, metricAlertSchema } from "./schemas.js";
 import { resolveProjectName } from "./sentry.js";
-import { sendMessage } from "./telegram.js";
+import { editMessage, sendMessage } from "./telegram.js";
 
 const DEFAULT_TIME_ZONE = "Asia/Jakarta";
+const APP_LOG_LEVELS = ["trace", "debug", "info", "warn", "error", "fatal", "silent"] as const;
+const SENTRY_EVENT_LEVELS = ["fatal", "error", "warning", "log", "info", "debug"] as const;
+const ERROR_CREATED_COUNTER_ENTRY_TTL_MS = 24 * 60 * 60 * 1000;
 
 const logger = pino({
     level: process.env.LOG_LEVEL ?? "info",
 });
+
+type ErrorCreatedCounterEntry = {
+    title: string;
+    project?: string;
+    detailUrl?: string;
+    observedAt: unknown;
+    count: number;
+    messageId?: number;
+    updatedAt: number;
+};
+
+const errorCreatedCounterEntries = new Map<string, ErrorCreatedCounterEntry>();
 
 function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null;
@@ -89,6 +105,31 @@ function escapeHtml(value: string): string {
     return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 }
 
+function asBoolean(value: unknown): boolean | undefined {
+    if (typeof value === "boolean") {
+        return value;
+    }
+
+    const normalized = asString(value)?.toLowerCase();
+    if (normalized === undefined) {
+        return undefined;
+    }
+
+    if (normalized === "true" || normalized === "1" || normalized === "yes") {
+        return true;
+    }
+    if (normalized === "false" || normalized === "0" || normalized === "no") {
+        return false;
+    }
+
+    return undefined;
+}
+
+function isArchivedIssueStatus(value: unknown): boolean {
+    const normalized = asString(value)?.toLowerCase();
+    return normalized === "archived" || normalized === "ignored";
+}
+
 function resolveTimeZone(configuredTimeZone: string | undefined, appLogger: Logger): string {
     const sanitizedConfiguredTimeZone = asString(configuredTimeZone);
     if (sanitizedConfiguredTimeZone === undefined) {
@@ -107,6 +148,23 @@ function resolveTimeZone(configuredTimeZone: string | undefined, appLogger: Logg
         });
         return DEFAULT_TIME_ZONE;
     }
+}
+
+function resolveSentryTraceSampleRate(configuredSampleRate: string | undefined, appLogger: Logger): number | undefined {
+    if (configuredSampleRate === undefined || configuredSampleRate.trim() === "") {
+        return undefined;
+    }
+
+    const sampleRate = Number.parseFloat(configuredSampleRate);
+    if (Number.isNaN(sampleRate) || sampleRate < 0 || sampleRate > 1) {
+        appLogger.warn({
+            msg: "invalid self sentry traces sample rate, value should be between 0 and 1",
+            configuredSampleRate,
+        });
+        return undefined;
+    }
+
+    return sampleRate;
 }
 
 function extractEnvironment(tags: unknown): string | undefined {
@@ -204,6 +262,44 @@ function createFallbackHookMessage(resource: string, action: string, requestBody
     return message;
 }
 
+function shouldIgnoreArchivedIssueWebhook(requestBody: unknown, action: string, sentryHookResource: string): boolean {
+    if (!["issue", "comment", "error", "event", "event_alert"].includes(sentryHookResource)) {
+        return false;
+    }
+
+    const normalizedAction = action.toLowerCase();
+    if (normalizedAction === "archive" || normalizedAction === "archived") {
+        return true;
+    }
+
+    const root = asRecord(requestBody);
+    const data = asRecord(root?.data);
+    const issuePayload = asRecord(data?.issue) ?? asRecord(asRecord(data?.error)?.issue);
+    const statusDetails = asRecord(issuePayload?.status_details) ?? asRecord(issuePayload?.statusDetails);
+    const errorPayload = asRecord(data?.error);
+
+    const issueStatusCandidates = [
+        issuePayload?.status,
+        issuePayload?.substatus,
+        statusDetails?.status,
+        data?.issue_status,
+        errorPayload?.issue_status,
+    ];
+    if (issueStatusCandidates.some((candidate) => isArchivedIssueStatus(candidate))) {
+        return true;
+    }
+
+    const issueArchivedFlags = [
+        issuePayload?.is_archived,
+        issuePayload?.isArchived,
+        statusDetails?.is_archived,
+        statusDetails?.isArchived,
+        errorPayload?.is_archived,
+        errorPayload?.isArchived,
+    ];
+    return issueArchivedFlags.some((candidate) => asBoolean(candidate) === true);
+}
+
 const configuration = {
     shouldValidateSignature: process.env.SHOULD_VALIDATE_SIGNATURE === "true",
     webhookSecret: process.env.WEBHOOK_SECRET ?? "",
@@ -219,11 +315,177 @@ const configuration = {
         process.env.MESSAGE_TIME_ZONE ?? process.env.TIME_ZONE ?? process.env.TIMEZONE ?? process.env.TZ,
         logger,
     ),
+    selfSentryDsn: process.env.SELF_SENTRY_DSN ?? "",
+    selfSentryEnvironment: process.env.SELF_SENTRY_ENVIRONMENT ?? process.env.NODE_ENV ?? "production",
+    selfSentryRelease: process.env.SELF_SENTRY_RELEASE,
+    selfSentryTracesSampleRate: resolveSentryTraceSampleRate(process.env.SELF_SENTRY_TRACES_SAMPLE_RATE, logger),
+    selfSentryDebug: process.env.SELF_SENTRY_DEBUG === "true",
 };
+
+function sendWebhookMessage(message: string, sentryHookResource: string, requestId: string | undefined): void {
+    sendMessage(configuration.telegramBotToken, {
+        chatId: configuration.telegramGroupId,
+        topicId: configuration.telegramTopicId,
+        message,
+        parseMode: "HTML",
+        disableLinkPreview: true,
+        protectContent: configuration.protectMessageContent,
+        logger,
+    }).catch((error) => {
+        SentryNode.captureException(error, {
+            tags: {
+                source: "telegram.sendMessage",
+                sentryHookResource,
+                requestId: requestId ?? "unknown",
+            },
+        });
+        logger.error({
+            msg: "failed to send webhook message to telegram",
+            error,
+            sentryHookResource,
+            requestId,
+        });
+    });
+}
+
+function buildErrorCreatedCounterEntryKey(title: string, project: string | undefined): string {
+    return `${(project ?? "unknown").toLowerCase()}|${title.toLowerCase()}`;
+}
+
+function buildErrorCreatedCounterMessage(
+    title: string,
+    project: string | undefined,
+    detailUrl: string | undefined,
+    observedAt: unknown,
+    count: number,
+): string {
+    let message = `<b>Error created: ${escapeHtml(title)}</b>\n`;
+
+    if (project !== undefined) {
+        message += `\nProject: ${escapeHtml(project)}`;
+    }
+
+    message += `\n\nDate: ${escapeHtml(formatDate(observedAt, configuration.timeZone))}`;
+    if (detailUrl !== undefined) {
+        message += `\nDetail: ${escapeHtml(detailUrl)}`;
+    }
+    message += `\nCount: ${count}`;
+
+    return message;
+}
+
+function clearExpiredErrorCreatedCounterEntries(now = Date.now()): void {
+    for (const [entryKey, entry] of errorCreatedCounterEntries.entries()) {
+        if (now - entry.updatedAt > ERROR_CREATED_COUNTER_ENTRY_TTL_MS) {
+            errorCreatedCounterEntries.delete(entryKey);
+        }
+    }
+}
+
+async function upsertErrorCreatedMessage(
+    title: string,
+    project: string | undefined,
+    detailUrl: string | undefined,
+    observedAt: unknown,
+): Promise<void> {
+    const now = Date.now();
+    clearExpiredErrorCreatedCounterEntries(now);
+
+    const entryKey = buildErrorCreatedCounterEntryKey(title, project);
+    const existingEntry = errorCreatedCounterEntries.get(entryKey);
+    const nextEntry: ErrorCreatedCounterEntry = {
+        title,
+        project,
+        detailUrl: detailUrl ?? existingEntry?.detailUrl,
+        observedAt,
+        count: (existingEntry?.count ?? 0) + 1,
+        messageId: existingEntry?.messageId,
+        updatedAt: now,
+    };
+    errorCreatedCounterEntries.set(entryKey, nextEntry);
+
+    const message = buildErrorCreatedCounterMessage(
+        nextEntry.title,
+        nextEntry.project,
+        nextEntry.detailUrl,
+        nextEntry.observedAt,
+        nextEntry.count,
+    );
+
+    try {
+        if (nextEntry.messageId !== undefined) {
+            const edited = await editMessage(configuration.telegramBotToken, {
+                chatId: configuration.telegramGroupId,
+                topicId: configuration.telegramTopicId,
+                messageId: nextEntry.messageId,
+                message,
+                parseMode: "HTML",
+                disableLinkPreview: true,
+                logger,
+            });
+
+            if (edited) {
+                return;
+            }
+        }
+
+        const sentMessageIds = await sendMessage(configuration.telegramBotToken, {
+            chatId: configuration.telegramGroupId,
+            topicId: configuration.telegramTopicId,
+            message,
+            parseMode: "HTML",
+            disableLinkPreview: true,
+            protectContent: configuration.protectMessageContent,
+            logger,
+        });
+
+        const firstMessageId = sentMessageIds.at(0);
+        if (firstMessageId !== undefined) {
+            nextEntry.messageId = firstMessageId;
+            errorCreatedCounterEntries.set(entryKey, nextEntry);
+        }
+    } catch (error) {
+        SentryNode.captureException(error, {
+            tags: {
+                source: "telegram.upsertErrorCreatedMessage",
+            },
+        });
+        logger.error({
+            msg: "failed to upsert error created counter message in telegram",
+            error,
+            title,
+            project,
+        });
+    }
+}
+
+if (configuration.selfSentryDsn !== "") {
+    SentryNode.init({
+        dsn: configuration.selfSentryDsn,
+        environment: configuration.selfSentryEnvironment,
+        release: configuration.selfSentryRelease,
+        tracesSampleRate: configuration.selfSentryTracesSampleRate,
+        debug: configuration.selfSentryDebug,
+    });
+
+    logger.info({
+        msg: "self sentry sdk enabled",
+        environment: configuration.selfSentryEnvironment,
+        release: configuration.selfSentryRelease,
+        tracesSampleRate: configuration.selfSentryTracesSampleRate,
+        debug: configuration.selfSentryDebug,
+    });
+}
 
 const app = new Hono();
 
 app.onError((error, c) => {
+    SentryNode.captureException(error, {
+        tags: {
+            source: "hono.onError",
+        },
+    });
+
     if (error instanceof ZodError) {
         logger.warn({ msg: "invalid request body", error: error.issues });
         return c.json({ message: "invalid request body", error: error.issues }, 400);
@@ -248,6 +510,17 @@ app.onError((error, c) => {
 
 app.get("/", (c) => {
     return c.text(".", 200);
+});
+
+app.get("/debug/levels", (c) => {
+    return c.json(
+        {
+            currentLogLevel: logger.level,
+            appLogLevels: APP_LOG_LEVELS,
+            sentryEventLevels: SENTRY_EVENT_LEVELS,
+        },
+        200,
+    );
 });
 
 app.post("/sentry/webhook", pinoLogger({ pino: logger }), async (c) => {
@@ -285,7 +558,18 @@ app.post("/sentry/webhook", pinoLogger({ pino: logger }), async (c) => {
         inferSentryHookResource(requestBody) ??
         "unknown";
 
+    if (shouldIgnoreArchivedIssueWebhook(requestBody, action, sentryHookResource)) {
+        c.get("logger").info({
+            msg: "ignoring archived issue related webhook",
+            sentryHookResource,
+            action,
+            requestId,
+        });
+        return c.json({ message: "ignored archived issue related webhook" }, 200);
+    }
+
     let message: string | null = null;
+    let errorCreatedMessageHandled = false;
 
     switch (sentryHookResource) {
         case "event_alert":
@@ -529,7 +813,12 @@ app.post("/sentry/webhook", pinoLogger({ pino: logger }), async (c) => {
                     errorMessage += `\n<b>Detail:</b> ${escapeHtml(detailUrl)}`;
                 }
 
-                message = errorMessage;
+                if (action.toLowerCase() === "created") {
+                    await upsertErrorCreatedMessage(title, project, detailUrl, observedAt);
+                    errorCreatedMessageHandled = true;
+                } else {
+                    message = errorMessage;
+                }
             }
             break;
         }
@@ -564,25 +853,19 @@ app.post("/sentry/webhook", pinoLogger({ pino: logger }), async (c) => {
         }
     }
 
+    if (errorCreatedMessageHandled) {
+        c.get("logger").debug({
+            msg: "updated error created counter message",
+            sentryHookResource,
+            requestId,
+        });
+        return c.json({ message: "ok" }, 200);
+    }
+
     const finalMessage =
         message ?? createFallbackHookMessage(sentryHookResource, action, requestBody, configuration.timeZone);
 
-    sendMessage(configuration.telegramBotToken, {
-        chatId: configuration.telegramGroupId,
-        topicId: configuration.telegramTopicId,
-        message: finalMessage,
-        parseMode: "HTML",
-        disableLinkPreview: true,
-        protectContent: configuration.protectMessageContent,
-        logger,
-    }).catch((error) =>
-        logger.error({
-            msg: "failed to send webhook message to telegram",
-            error,
-            sentryHookResource,
-            requestId,
-        }),
-    );
+    sendWebhookMessage(finalMessage, sentryHookResource, requestId);
 
     return c.json({ message: "ok" }, 200);
 });
