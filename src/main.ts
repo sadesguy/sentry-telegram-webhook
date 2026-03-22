@@ -11,6 +11,7 @@ import { resolveProjectName } from "./sentry.js";
 import { editMessage, sendMessage } from "./telegram.js";
 
 const DEFAULT_TIME_ZONE = "Asia/Jakarta";
+const DEFAULT_TELEGRAM_API_BASE_URL = "https://api.telegram.org";
 const APP_LOG_LEVELS = ["trace", "debug", "info", "warn", "error", "fatal", "silent"] as const;
 const SENTRY_EVENT_LEVELS = ["fatal", "error", "warning", "log", "info", "debug"] as const;
 const ERROR_CREATED_COUNTER_ENTRY_TTL_MS = 24 * 60 * 60 * 1000;
@@ -19,7 +20,8 @@ const logger = pino({
     level: process.env.LOG_LEVEL ?? "info",
 });
 
-type ErrorCreatedCounterEntry = {
+type ErrorActionCounterEntry = {
+    action: string;
     title: string;
     project?: string;
     detailUrl?: string;
@@ -31,8 +33,8 @@ type ErrorCreatedCounterEntry = {
     updatedAt: number;
 };
 
-const errorCreatedCounterEntries = new Map<string, ErrorCreatedCounterEntry>();
-const errorCreatedCounterUpdateQueue = new Map<string, Promise<void>>();
+const errorActionCounterEntries = new Map<string, ErrorActionCounterEntry>();
+const errorActionCounterUpdateQueue = new Map<string, Promise<void>>();
 
 function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null;
@@ -150,6 +152,30 @@ function resolveTimeZone(configuredTimeZone: string | undefined, appLogger: Logg
             error,
         });
         return DEFAULT_TIME_ZONE;
+    }
+}
+
+function resolveTelegramApiBaseUrl(configuredApiBaseUrl: string | undefined, appLogger: Logger): string {
+    const sanitizedConfiguredApiBaseUrl = asString(configuredApiBaseUrl);
+    if (sanitizedConfiguredApiBaseUrl === undefined) {
+        return DEFAULT_TELEGRAM_API_BASE_URL;
+    }
+
+    try {
+        const telegramApiBaseUrl = new URL(sanitizedConfiguredApiBaseUrl);
+        if (!["http:", "https:"].includes(telegramApiBaseUrl.protocol)) {
+            throw new Error(`unsupported protocol: ${telegramApiBaseUrl.protocol}`);
+        }
+
+        return telegramApiBaseUrl.toString().replace(/\/+$/, "");
+    } catch (error) {
+        appLogger.warn({
+            msg: "invalid telegram api base url provided, falling back to default",
+            configuredApiBaseUrl: sanitizedConfiguredApiBaseUrl,
+            fallbackApiBaseUrl: DEFAULT_TELEGRAM_API_BASE_URL,
+            error,
+        });
+        return DEFAULT_TELEGRAM_API_BASE_URL;
     }
 }
 
@@ -378,6 +404,7 @@ const configuration = {
     shouldValidateSignature: process.env.SHOULD_VALIDATE_SIGNATURE === "true",
     webhookSecret: process.env.WEBHOOK_SECRET ?? "",
     telegramBotToken: process.env.TELEGRAM_BOT_TOKEN ?? "",
+    telegramApiBaseUrl: resolveTelegramApiBaseUrl(process.env.TELEGRAM_API_BASE_URL, logger),
     telegramGroupId: Number.parseInt(process.env.TELEGRAM_GROUP_ID ?? ""),
     telegramTopicId: process.env.TELEGRAM_TOPIC_ID ? Number.parseInt(process.env.TELEGRAM_TOPIC_ID) : undefined,
     protectMessageContent: process.env.PROTECT_MESSAGE_CONTENT === "true",
@@ -398,6 +425,7 @@ const configuration = {
 
 function sendWebhookMessage(message: string, sentryHookResource: string, requestId: string | undefined): void {
     sendMessage(configuration.telegramBotToken, {
+        apiBaseUrl: configuration.telegramApiBaseUrl,
         chatId: configuration.telegramGroupId,
         topicId: configuration.telegramTopicId,
         message,
@@ -422,11 +450,12 @@ function sendWebhookMessage(message: string, sentryHookResource: string, request
     });
 }
 
-function buildErrorCreatedCounterEntryKey(title: string, project: string | undefined): string {
-    return `${(project ?? "unknown").toLowerCase()}|${title.toLowerCase()}`;
+function buildErrorActionCounterEntryKey(action: string, title: string, project: string | undefined): string {
+    return `${action.toLowerCase()}|${(project ?? "unknown").toLowerCase()}|${title.toLowerCase()}`;
 }
 
-function buildErrorCreatedCounterMessage(
+function buildErrorActionCounterMessage(
+    action: string,
     title: string,
     project: string | undefined,
     detailUrl: string | undefined,
@@ -435,7 +464,7 @@ function buildErrorCreatedCounterMessage(
     observedAt: unknown,
     count: number,
 ): string {
-    let message = `<b>Error created: ${escapeHtml(title)}</b>\n`;
+    let message = `<b>Error ${escapeHtml(action)}: ${escapeHtml(title)}</b>\n`;
 
     if (project !== undefined) {
         message += `\nProject: ${escapeHtml(project)}`;
@@ -460,15 +489,16 @@ function buildErrorCreatedCounterMessage(
     return message;
 }
 
-function clearExpiredErrorCreatedCounterEntries(now = Date.now()): void {
-    for (const [entryKey, entry] of errorCreatedCounterEntries.entries()) {
+function clearExpiredErrorActionCounterEntries(now = Date.now()): void {
+    for (const [entryKey, entry] of errorActionCounterEntries.entries()) {
         if (now - entry.updatedAt > ERROR_CREATED_COUNTER_ENTRY_TTL_MS) {
-            errorCreatedCounterEntries.delete(entryKey);
+            errorActionCounterEntries.delete(entryKey);
         }
     }
 }
 
-async function upsertErrorCreatedMessage(
+async function upsertErrorActionMessage(
+    action: string,
     title: string,
     project: string | undefined,
     detailUrl: string | undefined,
@@ -477,11 +507,12 @@ async function upsertErrorCreatedMessage(
     observedAt: unknown,
 ): Promise<void> {
     const now = Date.now();
-    clearExpiredErrorCreatedCounterEntries(now);
+    clearExpiredErrorActionCounterEntries(now);
 
-    const entryKey = buildErrorCreatedCounterEntryKey(title, project);
-    const existingEntry = errorCreatedCounterEntries.get(entryKey);
-    const nextEntry: ErrorCreatedCounterEntry = {
+    const entryKey = buildErrorActionCounterEntryKey(action, title, project);
+    const existingEntry = errorActionCounterEntries.get(entryKey);
+    const nextEntry: ErrorActionCounterEntry = {
+        action,
         title,
         project,
         detailUrl: detailUrl ?? existingEntry?.detailUrl,
@@ -492,9 +523,10 @@ async function upsertErrorCreatedMessage(
         messageId: existingEntry?.messageId,
         updatedAt: now,
     };
-    errorCreatedCounterEntries.set(entryKey, nextEntry);
+    errorActionCounterEntries.set(entryKey, nextEntry);
 
-    const message = buildErrorCreatedCounterMessage(
+    const message = buildErrorActionCounterMessage(
+        nextEntry.action,
         nextEntry.title,
         nextEntry.project,
         nextEntry.detailUrl,
@@ -507,6 +539,7 @@ async function upsertErrorCreatedMessage(
     try {
         if (nextEntry.messageId !== undefined) {
             const edited = await editMessage(configuration.telegramBotToken, {
+                apiBaseUrl: configuration.telegramApiBaseUrl,
                 chatId: configuration.telegramGroupId,
                 messageId: nextEntry.messageId,
                 message,
@@ -521,6 +554,7 @@ async function upsertErrorCreatedMessage(
 
             logger.warn({
                 msg: "failed to edit existing error counter message, skipping resend to avoid duplicate alerts",
+                action,
                 title,
                 project,
                 messageId: nextEntry.messageId,
@@ -529,6 +563,7 @@ async function upsertErrorCreatedMessage(
         }
 
         const sentMessageIds = await sendMessage(configuration.telegramBotToken, {
+            apiBaseUrl: configuration.telegramApiBaseUrl,
             chatId: configuration.telegramGroupId,
             topicId: configuration.telegramTopicId,
             message,
@@ -541,24 +576,27 @@ async function upsertErrorCreatedMessage(
         const firstMessageId = sentMessageIds.at(0);
         if (firstMessageId !== undefined) {
             nextEntry.messageId = firstMessageId;
-            errorCreatedCounterEntries.set(entryKey, nextEntry);
+            errorActionCounterEntries.set(entryKey, nextEntry);
         }
     } catch (error) {
         SentryNode.captureException(error, {
             tags: {
-                source: "telegram.upsertErrorCreatedMessage",
+                source: "telegram.upsertErrorActionMessage",
+                action,
             },
         });
         logger.error({
-            msg: "failed to upsert error created counter message in telegram",
+            msg: "failed to upsert error action counter message in telegram",
             error,
+            action,
             title,
             project,
         });
     }
 }
 
-function scheduleErrorCreatedMessageUpdate(
+function scheduleErrorActionMessageUpdate(
+    action: string,
     title: string,
     project: string | undefined,
     detailUrl: string | undefined,
@@ -566,19 +604,19 @@ function scheduleErrorCreatedMessageUpdate(
     serverName: string | undefined,
     observedAt: unknown,
 ): void {
-    const entryKey = buildErrorCreatedCounterEntryKey(title, project);
-    const previousTask = errorCreatedCounterUpdateQueue.get(entryKey) ?? Promise.resolve();
+    const entryKey = buildErrorActionCounterEntryKey(action, title, project);
+    const previousTask = errorActionCounterUpdateQueue.get(entryKey) ?? Promise.resolve();
 
     const nextTask = previousTask
         .catch(() => undefined)
-        .then(() => upsertErrorCreatedMessage(title, project, detailUrl, environment, serverName, observedAt))
+        .then(() => upsertErrorActionMessage(action, title, project, detailUrl, environment, serverName, observedAt))
         .finally(() => {
-            if (errorCreatedCounterUpdateQueue.get(entryKey) === nextTask) {
-                errorCreatedCounterUpdateQueue.delete(entryKey);
+            if (errorActionCounterUpdateQueue.get(entryKey) === nextTask) {
+                errorActionCounterUpdateQueue.delete(entryKey);
             }
         });
 
-    errorCreatedCounterUpdateQueue.set(entryKey, nextTask);
+    errorActionCounterUpdateQueue.set(entryKey, nextTask);
 }
 
 if (configuration.selfSentryDsn !== "") {
@@ -691,7 +729,7 @@ app.post("/sentry/webhook", pinoLogger({ pino: logger }), async (c) => {
     }
 
     let message: string | null = null;
-    let errorCreatedMessageHandled = false;
+    let errorActionMessageHandled = false;
 
     switch (sentryHookResource) {
         case "event_alert":
@@ -934,7 +972,6 @@ app.post("/sentry/webhook", pinoLogger({ pino: logger }), async (c) => {
                         "host",
                         "hostname",
                     ]);
-                const configuredDetailUrl = buildConfiguredSentryDetailUrl(detailUrl, configuration.sentryUrl);
                 const observedAt =
                     errorPayload.timestamp ??
                     errorPayload.date_created ??
@@ -942,30 +979,16 @@ app.post("/sentry/webhook", pinoLogger({ pino: logger }), async (c) => {
                     data?.date_created ??
                     requestBodyRecord?.timestamp;
 
-                let errorMessage = `<b>Error ${escapeHtml(action)}: ${escapeHtml(title)}</b>\n`;
-                if (project !== undefined) {
-                    errorMessage += `\nProject: ${escapeHtml(project)}`;
-                }
-                if (environment !== undefined) {
-                    errorMessage += `\nEnvironment: ${escapeHtml(environment)}`;
-                }
-                if (serverName !== undefined) {
-                    errorMessage += `\nServer: ${escapeHtml(serverName)}`;
-                }
-                errorMessage += `\n<b>Date:</b> ${escapeHtml(formatDate(observedAt, configuration.timeZone))}`;
-                if (detailUrl !== undefined) {
-                    errorMessage += `\n<b>Detail:</b> ${escapeHtml(detailUrl)}`;
-                }
-                if (configuredDetailUrl !== undefined) {
-                    errorMessage += `\n<b>Detail (Configured URL):</b> ${escapeHtml(configuredDetailUrl)}`;
-                }
-
-                if (action.toLowerCase() === "created") {
-                    scheduleErrorCreatedMessageUpdate(title, project, detailUrl, environment, serverName, observedAt);
-                    errorCreatedMessageHandled = true;
-                } else {
-                    message = errorMessage;
-                }
+                scheduleErrorActionMessageUpdate(
+                    action,
+                    title,
+                    project,
+                    detailUrl,
+                    environment,
+                    serverName,
+                    observedAt,
+                );
+                errorActionMessageHandled = true;
             }
             break;
         }
@@ -1000,10 +1023,11 @@ app.post("/sentry/webhook", pinoLogger({ pino: logger }), async (c) => {
         }
     }
 
-    if (errorCreatedMessageHandled) {
+    if (errorActionMessageHandled) {
         c.get("logger").debug({
-            msg: "updated error created counter message",
+            msg: "updated error action counter message",
             sentryHookResource,
+            action,
             requestId,
         });
         return c.json({ message: "ok" }, 200);

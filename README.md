@@ -64,10 +64,13 @@ docker run -d \
   -p 6500:6500 \
   -e WEBHOOK_SECRET="foobar" \
   -e TELEGRAM_BOT_TOKEN="123456789:ABCdefGHIjklMNOPqrstUVWXYZ" \
+  -e TELEGRAM_API_BASE_URL="https://api.telegram.org" \
   -e TELEGRAM_GROUP_ID="123456789" \
   -e TELEGRAM_TOPIC_ID="123456789" \
   sentry-telegram-webhook
 ```
+
+Set `TELEGRAM_API_BASE_URL` if you need to target a different Telegram Bot API endpoint. If unset, the app uses `https://api.telegram.org`.
 
 #### Systemd
 

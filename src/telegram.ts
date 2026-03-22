@@ -1,6 +1,7 @@
 import { type Logger } from "pino";
 
 const TELEGRAM_MAX_MESSAGE_LENGTH = 4096;
+const DEFAULT_TELEGRAM_API_BASE_URL = "https://api.telegram.org";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null;
@@ -25,6 +26,7 @@ function extractMessageId(responseBody: string): number | undefined {
 }
 
 export type SendMessageOptions = {
+    apiBaseUrl: string;
     chatId: number;
     topicId?: number;
     message: string;
@@ -35,6 +37,7 @@ export type SendMessageOptions = {
 };
 
 export type EditMessageOptions = {
+    apiBaseUrl: string;
     chatId: number;
     messageId: number;
     message: string;
@@ -75,6 +78,11 @@ function splitMessage(message: string, maxLength: number): string[] {
     return chunks;
 }
 
+function buildTelegramRequestUrl(apiBaseUrl: string, botToken: string, method: string): URL {
+    const normalizedApiBaseUrl = apiBaseUrl.endsWith("/") ? apiBaseUrl : `${apiBaseUrl}/`;
+    return new URL(`bot${botToken}/${method}`, normalizedApiBaseUrl);
+}
+
 export async function sendMessage(
     botToken: string,
     options: SendMessageOptions,
@@ -85,13 +93,18 @@ export async function sendMessage(
         return [];
     }
 
-    const requestUrl = new URL(`https://api.telegram.org/bot${botToken}/sendMessage`);
+    const requestUrl = buildTelegramRequestUrl(
+        options.apiBaseUrl || DEFAULT_TELEGRAM_API_BASE_URL,
+        botToken,
+        "sendMessage",
+    );
     const messageChunks = splitMessage(options.message, TELEGRAM_MAX_MESSAGE_LENGTH);
     const messageIds: number[] = [];
 
     options.logger.trace({
         msg: "sending message to telegram",
         botToken,
+        apiBaseUrl: options.apiBaseUrl,
         chatId: options.chatId,
         topicId: options.topicId,
         parseMode: options.parseMode ?? "MarkdownV2",
@@ -163,7 +176,11 @@ export async function editMessage(
         return false;
     }
 
-    const requestUrl = new URL(`https://api.telegram.org/bot${botToken}/editMessageText`);
+    const requestUrl = buildTelegramRequestUrl(
+        options.apiBaseUrl || DEFAULT_TELEGRAM_API_BASE_URL,
+        botToken,
+        "editMessageText",
+    );
     const requestBody = {
         chat_id: options.chatId,
         message_id: options.messageId,
