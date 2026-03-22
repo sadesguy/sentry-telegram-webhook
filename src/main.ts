@@ -14,27 +14,30 @@ const DEFAULT_TIME_ZONE = "Asia/Jakarta";
 const DEFAULT_TELEGRAM_API_BASE_URL = "https://api.telegram.org";
 const APP_LOG_LEVELS = ["trace", "debug", "info", "warn", "error", "fatal", "silent"] as const;
 const SENTRY_EVENT_LEVELS = ["fatal", "error", "warning", "log", "info", "debug"] as const;
-const ERROR_CREATED_COUNTER_ENTRY_TTL_MS = 24 * 60 * 60 * 1000;
+const GROUPED_WEBHOOK_ENTRY_TTL_MS = 24 * 60 * 60 * 1000;
 
 const logger = pino({
     level: process.env.LOG_LEVEL ?? "info",
 });
 
-type ErrorActionCounterEntry = {
+type GroupedWebhookCounterEntry = {
+    sentryHookResource: string;
     action: string;
-    title: string;
-    project?: string;
-    detailUrl?: string;
-    environment?: string;
-    serverName?: string;
-    observedAt: unknown;
+    bodyMessage: string;
     count: number;
     messageId?: number;
     updatedAt: number;
 };
 
-const errorActionCounterEntries = new Map<string, ErrorActionCounterEntry>();
-const errorActionCounterUpdateQueue = new Map<string, Promise<void>>();
+type GroupedWebhookMessage = {
+    entryKey: string;
+    sentryHookResource: string;
+    action: string;
+    bodyMessage: string;
+};
+
+const groupedWebhookCounterEntries = new Map<string, GroupedWebhookCounterEntry>();
+const groupedWebhookUpdateQueue = new Map<string, Promise<void>>();
 
 function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null;
@@ -362,6 +365,78 @@ function createFallbackHookMessage(resource: string, action: string, requestBody
     return message;
 }
 
+function buildGroupedWebhookEntryKey(
+    sentryHookResource: string,
+    action: string,
+    ...parts: Array<string | undefined>
+): string {
+    const normalizedParts = parts
+        .map((part) => part?.trim().toLowerCase())
+        .filter((part): part is string => part !== undefined && part !== "");
+
+    return [sentryHookResource.trim().toLowerCase(), action.trim().toLowerCase(), ...normalizedParts].join("|");
+}
+
+function createGroupedWebhookMessage(
+    sentryHookResource: string,
+    action: string,
+    bodyMessage: string,
+    ...keyParts: Array<string | undefined>
+): GroupedWebhookMessage {
+    return {
+        entryKey: buildGroupedWebhookEntryKey(sentryHookResource, action, ...keyParts),
+        sentryHookResource,
+        action,
+        bodyMessage,
+    };
+}
+
+function createFallbackGroupedWebhookMessage(
+    sentryHookResource: string,
+    action: string,
+    requestBody: unknown,
+    timeZone: string,
+): GroupedWebhookMessage {
+    const root = asRecord(requestBody);
+    const data = asRecord(root?.data);
+    const issue = asRecord(data?.issue);
+    const event = asRecord(data?.event);
+    const metricAlert = asRecord(data?.metric_alert);
+    const comment = asRecord(data?.comment);
+    const error = asRecord(data?.error);
+    const installation = asRecord(data?.installation) ?? asRecord(root?.installation);
+
+    const message = createFallbackHookMessage(sentryHookResource, action, requestBody, timeZone);
+    const detailUrl =
+        asString(data?.web_url) ??
+        asString(issue?.web_url) ??
+        asString(issue?.permalink) ??
+        asString(event?.web_url) ??
+        asString(event?.url) ??
+        asString(comment?.web_url) ??
+        asString(error?.web_url) ??
+        asString(error?.url);
+    const title =
+        asString(data?.description_title) ??
+        asString(issue?.title) ??
+        asString(event?.title) ??
+        asString(error?.title) ??
+        asString(data?.title);
+    const fallbackIdentity =
+        asString(issue?.id) ??
+        asString(issue?.shortId) ??
+        asString(comment?.id) ??
+        asString(event?.event_id) ??
+        asString(event?.id) ??
+        asString(error?.id) ??
+        asString(metricAlert?.id) ??
+        asString(installation?.uuid) ??
+        asString(installation?.slug) ??
+        asString(installation?.name);
+
+    return createGroupedWebhookMessage(sentryHookResource, action, message, detailUrl, fallbackIdentity, title);
+}
+
 function shouldIgnoreArchivedIssueWebhook(requestBody: unknown, action: string, sentryHookResource: string): boolean {
     if (!["issue", "comment", "error", "event", "event_alert"].includes(sentryHookResource)) {
         return false;
@@ -423,118 +498,34 @@ const configuration = {
     selfSentryDebug: process.env.SELF_SENTRY_DEBUG === "true",
 };
 
-function sendWebhookMessage(message: string, sentryHookResource: string, requestId: string | undefined): void {
-    sendMessage(configuration.telegramBotToken, {
-        apiBaseUrl: configuration.telegramApiBaseUrl,
-        chatId: configuration.telegramGroupId,
-        topicId: configuration.telegramTopicId,
-        message,
-        parseMode: "HTML",
-        disableLinkPreview: true,
-        protectContent: configuration.protectMessageContent,
-        logger,
-    }).catch((error) => {
-        SentryNode.captureException(error, {
-            tags: {
-                source: "telegram.sendMessage",
-                sentryHookResource,
-                requestId: requestId ?? "unknown",
-            },
-        });
-        logger.error({
-            msg: "failed to send webhook message to telegram",
-            error,
-            sentryHookResource,
-            requestId,
-        });
-    });
+function buildGroupedWebhookCounterMessage(bodyMessage: string, count: number): string {
+    return `${bodyMessage}\nCount: ${count}`;
 }
 
-function buildErrorActionCounterEntryKey(action: string, title: string, project: string | undefined): string {
-    return `${action.toLowerCase()}|${(project ?? "unknown").toLowerCase()}|${title.toLowerCase()}`;
-}
-
-function buildErrorActionCounterMessage(
-    action: string,
-    title: string,
-    project: string | undefined,
-    detailUrl: string | undefined,
-    environment: string | undefined,
-    serverName: string | undefined,
-    observedAt: unknown,
-    count: number,
-): string {
-    let message = `<b>Error ${escapeHtml(action)}: ${escapeHtml(title)}</b>\n`;
-
-    if (project !== undefined) {
-        message += `\nProject: ${escapeHtml(project)}`;
-    }
-    if (environment !== undefined) {
-        message += `\nEnvironment: ${escapeHtml(environment)}`;
-    }
-    if (serverName !== undefined) {
-        message += `\nServer: ${escapeHtml(serverName)}`;
-    }
-
-    message += `\n\nDate: ${escapeHtml(formatDate(observedAt, configuration.timeZone))}`;
-    if (detailUrl !== undefined) {
-        message += `\nDetail: ${escapeHtml(detailUrl)}`;
-    }
-    const configuredDetailUrl = buildConfiguredSentryDetailUrl(detailUrl, configuration.sentryUrl);
-    if (configuredDetailUrl !== undefined) {
-        message += `\nDetail (Configured URL): ${escapeHtml(configuredDetailUrl)}`;
-    }
-    message += `\nCount: ${count}`;
-
-    return message;
-}
-
-function clearExpiredErrorActionCounterEntries(now = Date.now()): void {
-    for (const [entryKey, entry] of errorActionCounterEntries.entries()) {
-        if (now - entry.updatedAt > ERROR_CREATED_COUNTER_ENTRY_TTL_MS) {
-            errorActionCounterEntries.delete(entryKey);
+function clearExpiredGroupedWebhookEntries(now = Date.now()): void {
+    for (const [entryKey, entry] of groupedWebhookCounterEntries.entries()) {
+        if (now - entry.updatedAt > GROUPED_WEBHOOK_ENTRY_TTL_MS) {
+            groupedWebhookCounterEntries.delete(entryKey);
         }
     }
 }
 
-async function upsertErrorActionMessage(
-    action: string,
-    title: string,
-    project: string | undefined,
-    detailUrl: string | undefined,
-    environment: string | undefined,
-    serverName: string | undefined,
-    observedAt: unknown,
-): Promise<void> {
+async function upsertGroupedWebhookMessage(groupedMessage: GroupedWebhookMessage): Promise<void> {
     const now = Date.now();
-    clearExpiredErrorActionCounterEntries(now);
+    clearExpiredGroupedWebhookEntries(now);
 
-    const entryKey = buildErrorActionCounterEntryKey(action, title, project);
-    const existingEntry = errorActionCounterEntries.get(entryKey);
-    const nextEntry: ErrorActionCounterEntry = {
-        action,
-        title,
-        project,
-        detailUrl: detailUrl ?? existingEntry?.detailUrl,
-        environment: environment ?? existingEntry?.environment,
-        serverName: serverName ?? existingEntry?.serverName,
-        observedAt,
+    const existingEntry = groupedWebhookCounterEntries.get(groupedMessage.entryKey);
+    const nextEntry: GroupedWebhookCounterEntry = {
+        sentryHookResource: groupedMessage.sentryHookResource,
+        action: groupedMessage.action,
+        bodyMessage: groupedMessage.bodyMessage,
         count: (existingEntry?.count ?? 0) + 1,
         messageId: existingEntry?.messageId,
         updatedAt: now,
     };
-    errorActionCounterEntries.set(entryKey, nextEntry);
+    groupedWebhookCounterEntries.set(groupedMessage.entryKey, nextEntry);
 
-    const message = buildErrorActionCounterMessage(
-        nextEntry.action,
-        nextEntry.title,
-        nextEntry.project,
-        nextEntry.detailUrl,
-        nextEntry.environment,
-        nextEntry.serverName,
-        nextEntry.observedAt,
-        nextEntry.count,
-    );
+    const message = buildGroupedWebhookCounterMessage(nextEntry.bodyMessage, nextEntry.count);
 
     try {
         if (nextEntry.messageId !== undefined) {
@@ -553,10 +544,10 @@ async function upsertErrorActionMessage(
             }
 
             logger.warn({
-                msg: "failed to edit existing error counter message, skipping resend to avoid duplicate alerts",
-                action,
-                title,
-                project,
+                msg: "failed to edit existing grouped webhook message, skipping resend to avoid duplicate alerts",
+                sentryHookResource: groupedMessage.sentryHookResource,
+                action: groupedMessage.action,
+                entryKey: groupedMessage.entryKey,
                 messageId: nextEntry.messageId,
             });
             return;
@@ -576,47 +567,39 @@ async function upsertErrorActionMessage(
         const firstMessageId = sentMessageIds.at(0);
         if (firstMessageId !== undefined) {
             nextEntry.messageId = firstMessageId;
-            errorActionCounterEntries.set(entryKey, nextEntry);
+            groupedWebhookCounterEntries.set(groupedMessage.entryKey, nextEntry);
         }
     } catch (error) {
         SentryNode.captureException(error, {
             tags: {
-                source: "telegram.upsertErrorActionMessage",
-                action,
+                source: "telegram.upsertGroupedWebhookMessage",
+                sentryHookResource: groupedMessage.sentryHookResource,
+                action: groupedMessage.action,
             },
         });
         logger.error({
-            msg: "failed to upsert error action counter message in telegram",
+            msg: "failed to upsert grouped webhook message in telegram",
             error,
-            action,
-            title,
-            project,
+            sentryHookResource: groupedMessage.sentryHookResource,
+            action: groupedMessage.action,
+            entryKey: groupedMessage.entryKey,
         });
     }
 }
 
-function scheduleErrorActionMessageUpdate(
-    action: string,
-    title: string,
-    project: string | undefined,
-    detailUrl: string | undefined,
-    environment: string | undefined,
-    serverName: string | undefined,
-    observedAt: unknown,
-): void {
-    const entryKey = buildErrorActionCounterEntryKey(action, title, project);
-    const previousTask = errorActionCounterUpdateQueue.get(entryKey) ?? Promise.resolve();
+function scheduleGroupedWebhookMessageUpdate(groupedMessage: GroupedWebhookMessage): void {
+    const previousTask = groupedWebhookUpdateQueue.get(groupedMessage.entryKey) ?? Promise.resolve();
 
     const nextTask = previousTask
         .catch(() => undefined)
-        .then(() => upsertErrorActionMessage(action, title, project, detailUrl, environment, serverName, observedAt))
+        .then(() => upsertGroupedWebhookMessage(groupedMessage))
         .finally(() => {
-            if (errorActionCounterUpdateQueue.get(entryKey) === nextTask) {
-                errorActionCounterUpdateQueue.delete(entryKey);
+            if (groupedWebhookUpdateQueue.get(groupedMessage.entryKey) === nextTask) {
+                groupedWebhookUpdateQueue.delete(groupedMessage.entryKey);
             }
         });
 
-    errorActionCounterUpdateQueue.set(entryKey, nextTask);
+    groupedWebhookUpdateQueue.set(groupedMessage.entryKey, nextTask);
 }
 
 if (configuration.selfSentryDsn !== "") {
@@ -728,8 +711,7 @@ app.post("/sentry/webhook", pinoLogger({ pino: logger }), async (c) => {
         return c.json({ message: "ignored archived issue related webhook" }, 200);
     }
 
-    let message: string | null = null;
-    let errorActionMessageHandled = false;
+    let groupedMessage: GroupedWebhookMessage | null = null;
 
     switch (sentryHookResource) {
         case "event_alert":
@@ -738,7 +720,10 @@ app.post("/sentry/webhook", pinoLogger({ pino: logger }), async (c) => {
 
             if (parsedIssueAlert.success) {
                 const event = parsedIssueAlert.data.data.event;
-                let eventAlertMessage = `<b>${escapeHtml(event.title)} (${escapeHtml(event.type)})</b>\n`;
+                const title = event.title;
+                const eventType = event.type;
+                const detailUrl = event.web_url;
+                let eventAlertMessage = `<b>${escapeHtml(title)} (${escapeHtml(eventType)})</b>\n`;
 
                 const resolvedProject = await resolveProjectName(event.project, configuration, c.req.raw.signal);
                 if (resolvedProject !== null) {
@@ -753,9 +738,17 @@ app.post("/sentry/webhook", pinoLogger({ pino: logger }), async (c) => {
                 }
 
                 eventAlertMessage += `\n<b>Date:</b> ${escapeHtml(formatDate(event.timestamp, configuration.timeZone))}`;
-                eventAlertMessage += "\n<b>Detail:</b> " + escapeHtml(event.web_url);
+                eventAlertMessage += "\n<b>Detail:</b> " + escapeHtml(detailUrl);
 
-                message = eventAlertMessage;
+                groupedMessage = createGroupedWebhookMessage(
+                    sentryHookResource,
+                    action,
+                    eventAlertMessage,
+                    detailUrl,
+                    String(event.project),
+                    title,
+                    eventType,
+                );
             } else {
                 const eventPayload = asRecord(asRecord(requestBodyRecord?.data)?.event);
                 if (eventPayload !== undefined) {
@@ -802,7 +795,15 @@ app.post("/sentry/webhook", pinoLogger({ pino: logger }), async (c) => {
                         eventAlertMessage += "\n<b>Detail:</b> " + escapeHtml(detailUrl);
                     }
 
-                    message = eventAlertMessage;
+                    groupedMessage = createGroupedWebhookMessage(
+                        sentryHookResource,
+                        action,
+                        eventAlertMessage,
+                        detailUrl,
+                        projectId !== undefined ? String(projectId) : projectSlug,
+                        title,
+                        eventType,
+                    );
                 }
             }
             break;
@@ -813,13 +814,23 @@ app.post("/sentry/webhook", pinoLogger({ pino: logger }), async (c) => {
 
             if (parsedMetricAlert.success) {
                 const metricPayload = parsedMetricAlert.data.data;
-                const descriptionTitle = escapeHtml(metricPayload.description_title);
-                const descriptionText = escapeHtml(metricPayload.description_text);
-                let metricMessage = `<b>${descriptionTitle} (${descriptionText})</b>\n`;
-                metricMessage += `\nProject: ${escapeHtml(metricPayload.metric_alert.projects?.join(", ") ?? "Unknown")}`;
+                const descriptionTitle = metricPayload.description_title;
+                const descriptionText = metricPayload.description_text;
+                const projectLabel = metricPayload.metric_alert.projects?.join(", ") ?? "Unknown";
+                const detailUrl = metricPayload.web_url;
+                let metricMessage = `<b>${escapeHtml(descriptionTitle)} (${escapeHtml(descriptionText)})</b>\n`;
+                metricMessage += `\nProject: ${escapeHtml(projectLabel)}`;
                 metricMessage += `\n<b>Date:</b> ${escapeHtml(formatDate(metricPayload.metric_alert.date_detected, configuration.timeZone))}`;
-                metricMessage += "\n<b>Detail:</b> " + escapeHtml(metricPayload.web_url);
-                message = metricMessage;
+                metricMessage += "\n<b>Detail:</b> " + escapeHtml(detailUrl);
+                groupedMessage = createGroupedWebhookMessage(
+                    sentryHookResource,
+                    action,
+                    metricMessage,
+                    detailUrl,
+                    descriptionTitle,
+                    descriptionText,
+                    projectLabel,
+                );
             } else {
                 const metricPayload = asRecord(asRecord(requestBodyRecord?.data)?.metric_alert);
                 const rootMetricPayload = asRecord(requestBodyRecord?.data);
@@ -849,7 +860,15 @@ app.post("/sentry/webhook", pinoLogger({ pino: logger }), async (c) => {
                         metricMessage += "\n<b>Detail:</b> " + escapeHtml(detailUrl);
                     }
 
-                    message = metricMessage;
+                    groupedMessage = createGroupedWebhookMessage(
+                        sentryHookResource,
+                        action,
+                        metricMessage,
+                        detailUrl,
+                        descriptionTitle,
+                        descriptionText,
+                        projectLabel,
+                    );
                 }
             }
             break;
@@ -897,7 +916,15 @@ app.post("/sentry/webhook", pinoLogger({ pino: logger }), async (c) => {
                     issueMessage += `\n<b>Detail:</b> ${escapeHtml(detailUrl)}`;
                 }
 
-                message = issueMessage;
+                groupedMessage = createGroupedWebhookMessage(
+                    sentryHookResource,
+                    action,
+                    issueMessage,
+                    detailUrl,
+                    asString(issuePayload.id) ?? asString(issuePayload.shortId),
+                    title,
+                    project,
+                );
             }
             break;
         }
@@ -934,7 +961,14 @@ app.post("/sentry/webhook", pinoLogger({ pino: logger }), async (c) => {
                     commentMessage += `\n<b>Detail:</b> ${escapeHtml(detailUrl)}`;
                 }
 
-                message = commentMessage;
+                groupedMessage = createGroupedWebhookMessage(
+                    sentryHookResource,
+                    action,
+                    commentMessage,
+                    detailUrl,
+                    issueTitle,
+                    commentBody,
+                );
             }
             break;
         }
@@ -978,17 +1012,36 @@ app.post("/sentry/webhook", pinoLogger({ pino: logger }), async (c) => {
                     errorPayload.date_detected ??
                     data?.date_created ??
                     requestBodyRecord?.timestamp;
+                const configuredDetailUrl = buildConfiguredSentryDetailUrl(detailUrl, configuration.sentryUrl);
 
-                scheduleErrorActionMessageUpdate(
+                let errorMessage = `<b>Error ${escapeHtml(action)}: ${escapeHtml(title)}</b>\n`;
+                if (project !== undefined) {
+                    errorMessage += `\nProject: ${escapeHtml(project)}`;
+                }
+                if (environment !== undefined) {
+                    errorMessage += `\nEnvironment: ${escapeHtml(environment)}`;
+                }
+                if (serverName !== undefined) {
+                    errorMessage += `\nServer: ${escapeHtml(serverName)}`;
+                }
+                errorMessage += `\n<b>Date:</b> ${escapeHtml(formatDate(observedAt, configuration.timeZone))}`;
+                if (detailUrl !== undefined) {
+                    errorMessage += `\n<b>Detail:</b> ${escapeHtml(detailUrl)}`;
+                }
+                if (configuredDetailUrl !== undefined) {
+                    errorMessage += `\n<b>Detail (Configured URL):</b> ${escapeHtml(configuredDetailUrl)}`;
+                }
+
+                groupedMessage = createGroupedWebhookMessage(
+                    sentryHookResource,
                     action,
+                    errorMessage,
+                    detailUrl ?? configuredDetailUrl,
                     title,
                     project,
-                    detailUrl,
                     environment,
                     serverName,
-                    observedAt,
                 );
-                errorActionMessageHandled = true;
             }
             break;
         }
@@ -1011,7 +1064,13 @@ app.post("/sentry/webhook", pinoLogger({ pino: logger }), async (c) => {
                 installationMessage += `\n<b>Detail:</b> ${escapeHtml(detailUrl)}`;
             }
 
-            message = installationMessage;
+            groupedMessage = createGroupedWebhookMessage(
+                sentryHookResource,
+                action,
+                installationMessage,
+                detailUrl,
+                installationName,
+            );
             break;
         }
         default: {
@@ -1023,20 +1082,19 @@ app.post("/sentry/webhook", pinoLogger({ pino: logger }), async (c) => {
         }
     }
 
-    if (errorActionMessageHandled) {
-        c.get("logger").debug({
-            msg: "updated error action counter message",
-            sentryHookResource,
-            action,
-            requestId,
-        });
-        return c.json({ message: "ok" }, 200);
-    }
+    const nextGroupedMessage =
+        groupedMessage ??
+        createFallbackGroupedWebhookMessage(sentryHookResource, action, requestBody, configuration.timeZone);
 
-    const finalMessage =
-        message ?? createFallbackHookMessage(sentryHookResource, action, requestBody, configuration.timeZone);
+    scheduleGroupedWebhookMessageUpdate(nextGroupedMessage);
 
-    sendWebhookMessage(finalMessage, sentryHookResource, requestId);
+    c.get("logger").debug({
+        msg: "scheduled grouped webhook message update",
+        sentryHookResource,
+        action,
+        requestId,
+        entryKey: nextGroupedMessage.entryKey,
+    });
 
     return c.json({ message: "ok" }, 200);
 });
