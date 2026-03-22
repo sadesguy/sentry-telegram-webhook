@@ -1,3 +1,5 @@
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { type Logger } from "pino";
 
 const TELEGRAM_MAX_MESSAGE_LENGTH = 4096;
@@ -24,6 +26,27 @@ function extractMessageId(responseBody: string): number | undefined {
         return undefined;
     }
 }
+
+function serializeError(error: unknown): Record<string, unknown> {
+    if (error instanceof Error) {
+        return {
+            name: error.name,
+            message: error.message,
+            stack: error.stack,
+            cause: error.cause,
+        };
+    }
+
+    return {
+        value: error,
+    };
+}
+
+type TelegramHttpResponse = {
+    status: number;
+    headers: Record<string, string | string[] | undefined>;
+    body: string;
+};
 
 export type SendMessageOptions = {
     apiBaseUrl: string;
@@ -79,8 +102,49 @@ function splitMessage(message: string, maxLength: number): string[] {
 }
 
 function buildTelegramRequestUrl(apiBaseUrl: string, botToken: string, method: string): URL {
-    const normalizedApiBaseUrl = apiBaseUrl.endsWith("/") ? apiBaseUrl : `${apiBaseUrl}/`;
-    return new URL(`bot${botToken}/${method}`, normalizedApiBaseUrl);
+    const requestUrl = new URL(apiBaseUrl.endsWith("/") ? apiBaseUrl : `${apiBaseUrl}/`);
+    requestUrl.pathname = `${requestUrl.pathname.replace(/\/+$/, "")}/bot${botToken}/${method}`;
+    return requestUrl;
+}
+
+async function executeTelegramRequest(
+    requestUrl: URL,
+    requestBody: Record<string, unknown>,
+    signal?: AbortSignal,
+): Promise<TelegramHttpResponse> {
+    const body = JSON.stringify(requestBody);
+
+    return await new Promise<TelegramHttpResponse>((resolve, reject) => {
+        const request = (requestUrl.protocol === "https:" ? httpsRequest : httpRequest)(
+            requestUrl,
+            {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "Content-Length": Buffer.byteLength(body).toString(),
+                },
+                signal: signal ?? AbortSignal.timeout(3 * 60 * 1000),
+            },
+            (response) => {
+                const chunks: Buffer[] = [];
+
+                response.on("data", (chunk: string | Buffer) => {
+                    chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+                });
+                response.on("end", () => {
+                    resolve({
+                        status: response.statusCode ?? 0,
+                        headers: response.headers,
+                        body: Buffer.concat(chunks).toString("utf8"),
+                    });
+                });
+            },
+        );
+
+        request.on("error", reject);
+        request.write(body);
+        request.end();
+    });
 }
 
 export async function sendMessage(
@@ -120,27 +184,27 @@ export async function sendMessage(
             disable_web_page_preview: options.disableLinkPreview,
             protect_content: options.protectContent,
         };
+        let response: TelegramHttpResponse;
+        try {
+            response = await executeTelegramRequest(requestUrl, requestBody, signal);
+        } catch (error) {
+            options.logger.error({
+                msg: "telegram send request failed before response",
+                error: serializeError(error),
+                request_url: requestUrl.toString(),
+                request_body: requestBody,
+                chunk: chunkIndex + 1,
+                total_chunks: messageChunks.length,
+            });
+            throw error;
+        }
 
-        const response = await fetch(requestUrl, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-            },
-            body: JSON.stringify(requestBody),
-            signal: signal ?? AbortSignal.timeout(3 * 60 * 1000),
-        });
-
-        if (!response.ok) {
-            const responseBody = await response.text();
-            const responseHeaders: Record<string, unknown> = {};
-            for (const [key, value] of response.headers) {
-                responseHeaders[key] = value;
-            }
+        if (response.status < 200 || response.status >= 300) {
             options.logger.warn({
                 msg: "failed to send message to telegram",
-                response_body: responseBody,
+                response_body: response.body,
                 status: response.status,
-                headers: responseHeaders,
+                headers: response.headers,
                 request_body: requestBody,
                 chunk: chunkIndex + 1,
                 total_chunks: messageChunks.length,
@@ -148,15 +212,14 @@ export async function sendMessage(
             return messageIds;
         }
 
-        const responseBody = await response.text();
-        const messageId = extractMessageId(responseBody);
+        const messageId = extractMessageId(response.body);
         if (messageId !== undefined) {
             messageIds.push(messageId);
         }
 
         options.logger.trace({
             msg: "sent message to telegram",
-            response_body: responseBody,
+            response_body: response.body,
             message_id: messageId,
             chunk: chunkIndex + 1,
             total_chunks: messageChunks.length,
@@ -188,28 +251,25 @@ export async function editMessage(
         parse_mode: options.parseMode ?? "MarkdownV2",
         disable_web_page_preview: options.disableLinkPreview,
     };
+    let response: TelegramHttpResponse;
+    try {
+        response = await executeTelegramRequest(requestUrl, requestBody, signal);
+    } catch (error) {
+        options.logger.error({
+            msg: "telegram edit request failed before response",
+            error: serializeError(error),
+            request_url: requestUrl.toString(),
+            request_body: requestBody,
+        });
+        throw error;
+    }
 
-    const response = await fetch(requestUrl, {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json",
-        },
-        body: JSON.stringify(requestBody),
-        signal: signal ?? AbortSignal.timeout(3 * 60 * 1000),
-    });
-
-    const responseBody = await response.text();
-    if (!response.ok) {
-        const responseHeaders: Record<string, unknown> = {};
-        for (const [key, value] of response.headers) {
-            responseHeaders[key] = value;
-        }
-
+    if (response.status < 200 || response.status >= 300) {
         options.logger.warn({
             msg: "failed to edit message in telegram",
-            response_body: responseBody,
+            response_body: response.body,
             status: response.status,
-            headers: responseHeaders,
+            headers: response.headers,
             request_body: requestBody,
         });
         return false;
@@ -217,7 +277,7 @@ export async function editMessage(
 
     options.logger.trace({
         msg: "edited message in telegram",
-        response_body: responseBody,
+        response_body: response.body,
         message_id: options.messageId,
     });
 

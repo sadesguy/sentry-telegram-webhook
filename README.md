@@ -72,6 +72,56 @@ docker run -d \
 
 Set `TELEGRAM_API_BASE_URL` if you need to target a different Telegram Bot API endpoint. If unset, the app uses `https://api.telegram.org`.
 
+#### Docker Smoke Test
+
+After the container is running, you can simulate a signed Sentry webhook from inside it with:
+
+```bash
+docker exec -i sentry-telegram-webhook sh -lc 'node --input-type=module <<'"'"'EOF'"'"'
+import { createHmac } from "node:crypto";
+
+const body = JSON.stringify({
+  action: "created",
+  data: {
+    project_slug: "smoke-test",
+    issue: {
+      id: "smoke-test-issue",
+      shortId: "SMOKE-1",
+      title: "Webhook smoke test from Docker",
+      level: "error",
+      status: "unresolved",
+      environment: "docker-test",
+      web_url: "https://example.invalid/issues/SMOKE-1",
+      date_created: new Date().toISOString()
+    }
+  }
+});
+
+const headers = {
+  "content-type": "application/json",
+  "sentry-hook-resource": "issue",
+  "request-id": "docker-smoke-test"
+};
+
+if (process.env.WEBHOOK_SECRET) {
+  headers["sentry-hook-signature"] = createHmac("sha256", process.env.WEBHOOK_SECRET)
+    .update(body, "utf8")
+    .digest("hex");
+}
+
+const response = await fetch(`http://127.0.0.1:${process.env.HTTP_PORT ?? "6500"}/sentry/webhook`, {
+  method: "POST",
+  headers,
+  body
+});
+
+console.log("status:", response.status);
+console.log(await response.text());
+EOF'
+```
+
+You should get `status: 200` and a Telegram message for `Issue created: Webhook smoke test from Docker`.
+
 #### Systemd
 
 > [!WARNING]

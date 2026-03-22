@@ -47,6 +47,21 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
     return isRecord(value) ? value : undefined;
 }
 
+function serializeError(error: unknown): Record<string, unknown> {
+    if (error instanceof Error) {
+        return {
+            name: error.name,
+            message: error.message,
+            stack: error.stack,
+            cause: error.cause,
+        };
+    }
+
+    return {
+        value: error,
+    };
+}
+
 function asString(value: unknown): string | undefined {
     if (typeof value !== "string") {
         return undefined;
@@ -579,7 +594,7 @@ async function upsertGroupedWebhookMessage(groupedMessage: GroupedWebhookMessage
         });
         logger.error({
             msg: "failed to upsert grouped webhook message in telegram",
-            error,
+            error: serializeError(error),
             sentryHookResource: groupedMessage.sentryHookResource,
             action: groupedMessage.action,
             entryKey: groupedMessage.entryKey,
