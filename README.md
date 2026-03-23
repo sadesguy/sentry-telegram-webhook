@@ -8,7 +8,7 @@ A rewrite of [tuanngocptn/sentry-telegram-webhook](https://github.com/tuanngocpt
 
 ### Internal Integration Setup
 
-You will need to create an Internal Integration on your Sentry instance: https://docs.sentry.io/organization/integrations/integration-platform/internal-integration/
+You will need to create an Internal Integration on your Sentry instance: <https://docs.sentry.io/organization/integrations/integration-platform/internal-integration/>
 
 ![alt text](.github/assets/imgs/sentry_integration_setup1.png)
 
@@ -16,17 +16,15 @@ You will need to create an Internal Integration on your Sentry instance: https:/
 
 The permission scope is really up to you, what in the screenshot is the minimum.
 
-
 ### Telegram Bot Setup
 
-See here: https://core.telegram.org/bots/tutorial
+See here: <https://core.telegram.org/bots/tutorial>
 
 1. Go to @BotFather
 2. Create a new bot
 3. Acquire the "bot token"
 4. Invite the bot into your group (or specific group topic)
-5. Acquire the "group ID" and the "topic ID" if you want one. See https://stackoverflow.com/questions/32423837/telegram-bot-how-to-get-a-group-chat-id
-
+5. Acquire the "group ID" and the "topic ID" if you want one. See <https://stackoverflow.com/questions/32423837/telegram-bot-how-to-get-a-group-chat-id>
 
 ### Application setup
 
