@@ -107,6 +107,25 @@ function buildTelegramRequestUrl(apiBaseUrl: string, botToken: string, method: s
     return requestUrl;
 }
 
+function redactTelegramRequestUrl(requestUrl: URL): string {
+    return requestUrl.toString().replace(/\/bot[^/]+\//, "/bot<redacted>/");
+}
+
+function getTelegramFailureHint(response: TelegramHttpResponse, apiBaseUrl: string): string | undefined {
+    const responseBody = response.body.trimStart().toLowerCase();
+    const contentTypeHeader = response.headers["content-type"];
+    const contentType = Array.isArray(contentTypeHeader) ? contentTypeHeader.join(", ") : contentTypeHeader;
+    const normalizedContentType = contentType?.toLowerCase();
+    const isHtmlResponse =
+        normalizedContentType?.includes("text/html") === true || responseBody.startsWith("<!doctype html") || responseBody.startsWith("<html");
+
+    if (response.status === 403 && isHtmlResponse && apiBaseUrl !== DEFAULT_TELEGRAM_API_BASE_URL) {
+        return "received an HTML 403 from the configured Telegram API endpoint; check reverse-proxy access rules for the container network or switch TELEGRAM_API_BASE_URL to https://api.telegram.org";
+    }
+
+    return undefined;
+}
+
 async function executeTelegramRequest(
     requestUrl: URL,
     requestBody: Record<string, unknown>,
@@ -167,7 +186,7 @@ export async function sendMessage(
 
     options.logger.trace({
         msg: "sending message to telegram",
-        botToken,
+        request_url: redactTelegramRequestUrl(requestUrl),
         apiBaseUrl: options.apiBaseUrl,
         chatId: options.chatId,
         topicId: options.topicId,
@@ -191,7 +210,7 @@ export async function sendMessage(
             options.logger.error({
                 msg: "telegram send request failed before response",
                 error: serializeError(error),
-                request_url: requestUrl.toString(),
+                request_url: redactTelegramRequestUrl(requestUrl),
                 request_body: requestBody,
                 chunk: chunkIndex + 1,
                 total_chunks: messageChunks.length,
@@ -202,9 +221,11 @@ export async function sendMessage(
         if (response.status < 200 || response.status >= 300) {
             options.logger.warn({
                 msg: "failed to send message to telegram",
+                request_url: redactTelegramRequestUrl(requestUrl),
                 response_body: response.body,
                 status: response.status,
                 headers: response.headers,
+                hint: getTelegramFailureHint(response, options.apiBaseUrl),
                 request_body: requestBody,
                 chunk: chunkIndex + 1,
                 total_chunks: messageChunks.length,
@@ -258,7 +279,7 @@ export async function editMessage(
         options.logger.error({
             msg: "telegram edit request failed before response",
             error: serializeError(error),
-            request_url: requestUrl.toString(),
+            request_url: redactTelegramRequestUrl(requestUrl),
             request_body: requestBody,
         });
         throw error;
@@ -267,9 +288,11 @@ export async function editMessage(
     if (response.status < 200 || response.status >= 300) {
         options.logger.warn({
             msg: "failed to edit message in telegram",
+            request_url: redactTelegramRequestUrl(requestUrl),
             response_body: response.body,
             status: response.status,
             headers: response.headers,
+            hint: getTelegramFailureHint(response, options.apiBaseUrl),
             request_body: requestBody,
         });
         return false;
