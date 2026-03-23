@@ -108,7 +108,12 @@ function buildTelegramRequestUrl(apiBaseUrl: string, botToken: string, method: s
 }
 
 function redactTelegramRequestUrl(requestUrl: URL): string {
-    return requestUrl.toString().replace(/\/bot[^/]+\//, "/bot<redacted>/");
+    const redactedUrl = new URL(requestUrl.toString());
+    redactedUrl.pathname = redactedUrl.pathname
+        .split("/")
+        .map((segment) => (segment.startsWith("bot") && segment.includes(":") ? "bot<redacted>" : segment))
+        .join("/");
+    return redactedUrl.toString();
 }
 
 function getTelegramFailureHint(response: TelegramHttpResponse, apiBaseUrl: string): string | undefined {

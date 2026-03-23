@@ -318,6 +318,59 @@ function buildConfiguredSentryDetailUrl(
     }
 }
 
+function normalizeIssueDetailUrl(detailUrl: string | undefined): string | undefined {
+    const sanitizedDetailUrl = asString(detailUrl);
+    if (sanitizedDetailUrl === undefined) {
+        return undefined;
+    }
+
+    try {
+        const url = new URL(sanitizedDetailUrl);
+        url.pathname = url.pathname.replace(/(\/issues\/[^/]+)\/events\/[^/]+\/?$/, "$1/");
+        return url.toString();
+    } catch {
+        return sanitizedDetailUrl;
+    }
+}
+
+function extractIssueIdentityFromUrl(detailUrl: string | undefined): string | undefined {
+    const sanitizedDetailUrl = asString(detailUrl);
+    if (sanitizedDetailUrl === undefined) {
+        return undefined;
+    }
+
+    try {
+        const url = new URL(sanitizedDetailUrl);
+        const issueMatch = url.pathname.match(/\/issues\/([^/]+)/);
+        return issueMatch?.at(1);
+    } catch {
+        return undefined;
+    }
+}
+
+function extractWebhookIssueIdentity(requestBody: unknown): string | undefined {
+    const root = asRecord(requestBody);
+    const data = asRecord(root?.data);
+    const issue = asRecord(data?.issue);
+    const error = asRecord(data?.error);
+    const errorIssue = asRecord(error?.issue);
+    const event = asRecord(data?.event);
+    const comment = asRecord(data?.comment);
+
+    return (
+        asString(issue?.id) ??
+        asString(issue?.shortId) ??
+        asString(errorIssue?.id) ??
+        asString(errorIssue?.shortId) ??
+        asString(event?.issue_id) ??
+        asString(comment?.issue_id) ??
+        extractIssueIdentityFromUrl(asString(issue?.web_url) ?? asString(issue?.permalink)) ??
+        extractIssueIdentityFromUrl(asString(event?.issue_url) ?? asString(event?.web_url) ?? asString(event?.url)) ??
+        extractIssueIdentityFromUrl(asString(error?.web_url) ?? asString(error?.url)) ??
+        extractIssueIdentityFromUrl(asString(data?.web_url) ?? asString(data?.url))
+    );
+}
+
 function inferSentryHookResource(requestBody: unknown): string | undefined {
     const root = asRecord(requestBody);
     const data = asRecord(root?.data);
@@ -420,17 +473,19 @@ function createFallbackGroupedWebhookMessage(
     const comment = asRecord(data?.comment);
     const error = asRecord(data?.error);
     const installation = asRecord(data?.installation) ?? asRecord(root?.installation);
+    const issueIdentity = extractWebhookIssueIdentity(requestBody);
 
     const message = createFallbackHookMessage(sentryHookResource, action, requestBody, timeZone);
-    const detailUrl =
+    const detailUrl = normalizeIssueDetailUrl(
         asString(data?.web_url) ??
-        asString(issue?.web_url) ??
-        asString(issue?.permalink) ??
+            asString(issue?.web_url) ??
+            asString(issue?.permalink) ??
         asString(event?.web_url) ??
         asString(event?.url) ??
         asString(comment?.web_url) ??
         asString(error?.web_url) ??
-        asString(error?.url);
+        asString(error?.url),
+    );
     const title =
         asString(data?.description_title) ??
         asString(issue?.title) ??
@@ -449,7 +504,15 @@ function createFallbackGroupedWebhookMessage(
         asString(installation?.slug) ??
         asString(installation?.name);
 
-    return createGroupedWebhookMessage(sentryHookResource, action, message, detailUrl, fallbackIdentity, title);
+    return createGroupedWebhookMessage(
+        sentryHookResource,
+        action,
+        message,
+        issueIdentity,
+        detailUrl,
+        fallbackIdentity,
+        title,
+    );
 }
 
 function shouldIgnoreArchivedIssueWebhook(requestBody: unknown, action: string, sentryHookResource: string): boolean {
@@ -737,7 +800,8 @@ app.post("/sentry/webhook", pinoLogger({ pino: logger }), async (c) => {
                 const event = parsedIssueAlert.data.data.event;
                 const title = event.title;
                 const eventType = event.type;
-                const detailUrl = event.web_url;
+                const issueIdentity = event.issue_id;
+                const detailUrl = normalizeIssueDetailUrl(event.issue_url ?? event.web_url);
                 let eventAlertMessage = `<b>${escapeHtml(title)} (${escapeHtml(eventType)})</b>\n`;
 
                 const resolvedProject = await resolveProjectName(event.project, configuration, c.req.raw.signal);
@@ -753,12 +817,15 @@ app.post("/sentry/webhook", pinoLogger({ pino: logger }), async (c) => {
                 }
 
                 eventAlertMessage += `\n<b>Date:</b> ${escapeHtml(formatDate(event.timestamp, configuration.timeZone))}`;
-                eventAlertMessage += "\n<b>Detail:</b> " + escapeHtml(detailUrl);
+                if (detailUrl !== undefined) {
+                    eventAlertMessage += "\n<b>Detail:</b> " + escapeHtml(detailUrl);
+                }
 
                 groupedMessage = createGroupedWebhookMessage(
                     sentryHookResource,
                     action,
                     eventAlertMessage,
+                    issueIdentity,
                     detailUrl,
                     String(event.project),
                     title,
@@ -801,11 +868,19 @@ app.post("/sentry/webhook", pinoLogger({ pino: logger }), async (c) => {
                         asRecord(requestBodyRecord?.data)?.date_detected;
                     eventAlertMessage += `\n<b>Date:</b> ${escapeHtml(formatDate(eventDate, configuration.timeZone))}`;
 
-                    const detailUrl =
-                        asString(eventPayload.web_url) ??
+                    const issueIdentity =
+                        asString(eventPayload.issue_id) ??
+                        extractIssueIdentityFromUrl(
+                            asString(eventPayload.issue_url) ??
+                                asString(eventPayload.web_url) ??
+                                asString(eventPayload.url),
+                        );
+                    const detailUrl = normalizeIssueDetailUrl(
                         asString(eventPayload.issue_url) ??
-                        asString(eventPayload.url) ??
-                        asString(asRecord(requestBodyRecord?.data)?.web_url);
+                            asString(eventPayload.web_url) ??
+                            asString(eventPayload.url) ??
+                            asString(asRecord(requestBodyRecord?.data)?.web_url),
+                    );
                     if (detailUrl !== undefined) {
                         eventAlertMessage += "\n<b>Detail:</b> " + escapeHtml(detailUrl);
                     }
@@ -814,6 +889,7 @@ app.post("/sentry/webhook", pinoLogger({ pino: logger }), async (c) => {
                         sentryHookResource,
                         action,
                         eventAlertMessage,
+                        issueIdentity,
                         detailUrl,
                         projectId !== undefined ? String(projectId) : projectSlug,
                         title,
@@ -893,6 +969,10 @@ app.post("/sentry/webhook", pinoLogger({ pino: logger }), async (c) => {
             const issuePayload = asRecord(data?.issue);
             if (issuePayload !== undefined) {
                 const title = asString(issuePayload.title) ?? "Sentry Issue";
+                const issueIdentity =
+                    asString(issuePayload.id) ??
+                    asString(issuePayload.shortId) ??
+                    extractIssueIdentityFromUrl(asString(issuePayload.web_url) ?? asString(issuePayload.permalink));
                 const project =
                     asString(data?.project_slug) ??
                     asString(issuePayload.project_slug) ??
@@ -935,8 +1015,7 @@ app.post("/sentry/webhook", pinoLogger({ pino: logger }), async (c) => {
                     sentryHookResource,
                     action,
                     issueMessage,
-                    detailUrl,
-                    asString(issuePayload.id) ?? asString(issuePayload.shortId),
+                    issueIdentity,
                     title,
                     project,
                 );
@@ -954,11 +1033,13 @@ app.post("/sentry/webhook", pinoLogger({ pino: logger }), async (c) => {
                     asString(commentPayload?.text) ??
                     asString(commentPayload?.body) ??
                     asString(commentPayload?.comment);
-                const detailUrl =
+                const issueIdentity = extractWebhookIssueIdentity(requestBody);
+                const detailUrl = normalizeIssueDetailUrl(
                     asString(commentPayload?.web_url) ??
-                    asString(issuePayload?.web_url) ??
-                    asString(data?.web_url) ??
-                    asString(data?.url);
+                        asString(issuePayload?.web_url) ??
+                        asString(data?.web_url) ??
+                        asString(data?.url),
+                );
                 const observedAt =
                     commentPayload?.date_created ??
                     commentPayload?.date_updated ??
@@ -980,6 +1061,7 @@ app.post("/sentry/webhook", pinoLogger({ pino: logger }), async (c) => {
                     sentryHookResource,
                     action,
                     commentMessage,
+                    issueIdentity,
                     detailUrl,
                     issueTitle,
                     commentBody,
@@ -993,6 +1075,7 @@ app.post("/sentry/webhook", pinoLogger({ pino: logger }), async (c) => {
             const issuePayload = asRecord(data?.issue) ?? asRecord(errorPayload?.issue);
 
             if (errorPayload !== undefined) {
+                const issueIdentity = extractWebhookIssueIdentity(requestBody);
                 const title =
                     asString(errorPayload.title) ??
                     asString(errorPayload.message) ??
@@ -1002,11 +1085,15 @@ app.post("/sentry/webhook", pinoLogger({ pino: logger }), async (c) => {
                     asString(errorPayload.project_slug) ??
                     asString(asRecord(errorPayload.project)?.slug) ??
                     asString(asRecord(errorPayload.project)?.name);
-                const detailUrl =
+                const rawDetailUrl =
                     asString(errorPayload.web_url) ??
                     asString(errorPayload.url) ??
                     asString(data?.web_url) ??
                     asString(data?.url);
+                const detailUrl =
+                    asString(issuePayload?.web_url) ??
+                    asString(issuePayload?.permalink) ??
+                    normalizeIssueDetailUrl(rawDetailUrl);
                 const environment =
                     asString(errorPayload.environment) ??
                     asString(issuePayload?.environment) ??
@@ -1051,6 +1138,7 @@ app.post("/sentry/webhook", pinoLogger({ pino: logger }), async (c) => {
                     sentryHookResource,
                     action,
                     errorMessage,
+                    issueIdentity,
                     detailUrl ?? configuredDetailUrl,
                     title,
                     project,
