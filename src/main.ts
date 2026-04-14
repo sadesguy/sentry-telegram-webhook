@@ -1140,7 +1140,6 @@ app.post("/sentry/webhook", pinoLogger({ pino: logger }), async (c) => {
                     errorMessage,
                     issueIdentity,
                     detailUrl ?? configuredDetailUrl,
-                    title,
                     project,
                     environment,
                     serverName,
